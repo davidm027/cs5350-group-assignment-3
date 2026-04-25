@@ -53,7 +53,6 @@ Matrix MM_1D(Matrix A, Matrix B, int p) {
     Matrix C(m, b_columns);
 
 
-
     {
         int i, j, k;
         int thread_num = p;
@@ -65,23 +64,33 @@ Matrix MM_1D(Matrix A, Matrix B, int p) {
         if (thread_num == p - 1) {
             end = A.get_rows();
         }
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
+        // sending data from process 0 to all the others (sending n/p chunks
+        if (rank == 0) {
+            for (int i = 1; i < p; i++) {
+                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  , number_of_rows_per_thread * n, MPI_INT, i, i,MPI_COMM_WORLD);
+            }
+        }
+        else {
+            Matrix LocalA = Matrix(number_of_rows_per_thread, n);
+            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, rank,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
 
-
-        for (int i = 0; i < p; i++) {
-            MPI_Send(&A   , 1, MPI_INT, partner_rank, 0,
-                     MPI_COMM_WORLD);
-
-
-
-
-
-
+        // need to do the same for B
+        if (rank == 0) {
+            for (int i = 1; i < p; i++) {
+                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  , number_of_rows_per_thread * n, MPI_INT, i, i,MPI_COMM_WORLD);
+            }
+        }
+        else {
+            Matrix LocalA = Matrix(number_of_rows_per_thread, n);
+            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, rank,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
 
         for (i = start; i < end; i++) {
             for (j = 0; j < b_columns; j++) {
-
                 int temp = 0;
                 for (k = 0; k < n; k++) {
                     int a = A.get_value_at(i, k);
