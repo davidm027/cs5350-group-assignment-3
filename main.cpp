@@ -1,7 +1,7 @@
 // Comparison of the performances of serial and parallel
 // Matrix Multiplication algorithm implementations
 
-#include <omp.h>
+#include <mpi.h>
 
 #include <boost/program_options.hpp>
 #include <cassert>
@@ -38,21 +38,13 @@ Matrix MM_ser(Matrix A, Matrix B) {
     return C;
 }
 
-// Simple parallel algorithm
-Matrix MM_Par(Matrix A, Matrix B) {
-    int m = A.get_rows();
-    int n = A.get_columns();
-    int p = B.get_columns();
-
-    Matrix C(m, p);
-
-    // TODO: complete
-
-    return C;
-}
 
 // 1D Parallel algorithm
 Matrix MM_1D(Matrix A, Matrix B, int p) {
+
+    if (p > A.get_rows())
+        p = A.get_rows();
+
     int m = A.get_rows();
     int n = A.get_columns();
     int b_columns = B.get_columns();
@@ -60,22 +52,109 @@ Matrix MM_1D(Matrix A, Matrix B, int p) {
 
     Matrix C(m, b_columns);
 
-    // TODO:
 
+
+    {
+        int i, j, k;
+        int thread_num = p;
+
+        int start = thread_num * number_of_rows_per_thread;
+        int end =
+            thread_num * number_of_rows_per_thread + number_of_rows_per_thread;
+
+        if (thread_num == p - 1) {
+            end = A.get_rows();
+        }
+
+
+
+        for (int i = 0; i < p; i++) {
+            MPI_Send(&A   , 1, MPI_INT, partner_rank, 0,
+                     MPI_COMM_WORLD);
+
+
+
+
+
+
+        }
+
+        for (i = start; i < end; i++) {
+            for (j = 0; j < b_columns; j++) {
+
+                int temp = 0;
+                for (k = 0; k < n; k++) {
+                    int a = A.get_value_at(i, k);
+                    int b = B.get_value_at(k, j);
+                    int c = a * b;
+                    temp += c;
+                }
+                C.set_value_at(i, j, temp);
+            }
+        }
+    }
     return C;
 }
 
 // 2D Parallel algorithm
 Matrix MM_2D(Matrix A, Matrix B, int p) {
+    // CTRACK;
     int m1 = A.get_rows();
     int n1 = A.get_columns();
-    int m2 = B.get_rows();
     int n2 = B.get_columns();
 
     Matrix C(m1, n2);
-
-    // TODO:
-
+    // int thread_dim = (int)std::sqrt(p);
+    // int number_of_rows_per_thread = A.get_rows() / thread_dim;
+    // int number_of_columns_per_thread = B.get_columns() / thread_dim;
+    // omp_set_num_threads(p);
+    //
+    //
+    // #pragma omp parallel shared(A, B, C)
+    // {
+    //     int i, j, k;
+    //     int thread_num = omp_get_thread_num();
+    //     int row = thread_num / thread_dim;
+    //     int col = thread_num % thread_dim;
+    //     int start = row * number_of_rows_per_thread;
+    //     int end = m1;
+    //     if (end <= m1) {
+    //         end = start + number_of_rows_per_thread;
+    //     }
+    //
+    //     int column_start = col * number_of_columns_per_thread;
+    //
+    //     int end_column = n2;
+    //
+    //     if (end_column <= n2) {
+    //         end_column = column_start + number_of_columns_per_thread;
+    //     }
+    //
+    //     int k_start = col * (n1/thread_dim);
+    //
+    //     int k_end = n1;
+    //
+    //     if (k_end <= n1) {
+    //         k_end = k_start + (n1 / thread_dim);
+    //
+    //     }
+    //
+    //     for (i = start; i < end; i++) {
+    //         for (j = 0; j < n2; j++) {
+    //             int temp = 0;
+    //             for (k = k_start; k < k_end; k++) {
+    //                 int a = A.get_value_at(i, k);
+    //                 int b = B.get_value_at(k, j);
+    //                 temp += a * b;
+    //             }
+    //             #pragma omp critical
+    //             {
+    //                 temp += C.get_value_at(i, j);
+    //                 C.set_value_at(i, j, temp);
+    //             }
+    //         }
+    //     }
+    // }
     return C;
 }
 
@@ -94,8 +173,19 @@ Matrix create_random_matrix(int rows, int columns, unsigned int seed = 5350) {
     return C;
 }
 
-int main(int argc, const char* argv[]) {
+int main(int argc,  char* argv[]) {
+
+    MPI_Init(&argc, &argv);
+
+    int size;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+
+
+    MPI_Finalize();
+
     int m, n, q, P, seed;
+    P = size;
     std::string fname;
 
     namespace po = boost::program_options;
@@ -147,12 +237,7 @@ int main(int argc, const char* argv[]) {
                             std::chrono::duration<double>(end_ser - start_ser))
                             .count();
 
-    auto start_par = std::chrono::steady_clock::now();
-    Matrix c2 = MM_Par(a, b);
-    auto end_par = std::chrono::steady_clock::now();
-    auto duration_par = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::duration<double>(end_par - start_par))
-                            .count();
+
 
     auto start_1d = std::chrono::steady_clock::now();
     Matrix c3 = MM_1D(a, b, P);
@@ -173,7 +258,6 @@ int main(int argc, const char* argv[]) {
     std::cout << q << ",";
     std::cout << P << ",";
     std::cout << duration_ser << ",";
-    std::cout << duration_par << ",";
     std::cout << duration_1d << ",";
     std::cout << duration_2d << ",";
     std::cout << seed << "\n";
