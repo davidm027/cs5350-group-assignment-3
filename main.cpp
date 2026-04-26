@@ -40,63 +40,60 @@ Matrix MM_ser(Matrix A, Matrix B) {
 
 
 // 1D Parallel algorithm
+
+// issues to fix:
+// I think we should check if matrix not square, basically last thread shoudl get whatever low left,
+// not sure if indexing in transpose is correct need to fix!
+// need to send calculation results back to process 0
 Matrix MM_1D(Matrix A, Matrix B, int p) {
 
     if (p > A.get_rows())
         p = A.get_rows();
-
     int m = A.get_rows();
     int n = A.get_columns();
     int b_columns = B.get_columns();
     int number_of_rows_per_thread = A.get_rows() / p;
-
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    Matrix B_T = B.transpose();
     Matrix C(m, b_columns);
-
-
     {
         int i, j, k;
-        int thread_num = p;
-
+        int thread_num = rank;
         int start = thread_num * number_of_rows_per_thread;
-        int end =
-            thread_num * number_of_rows_per_thread + number_of_rows_per_thread;
-
+        int end = thread_num * number_of_rows_per_thread + number_of_rows_per_thread;
         if (thread_num == p - 1) {
             end = A.get_rows();
         }
-        int rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        Matrix LocalA(number_of_rows_per_thread, n);
+        Matrix LocalB_T(n, number_of_rows_per_thread);
 
         // sending data from process 0 to all the others (sending n/p chunks
         if (rank == 0) {
             for (int i = 1; i < p; i++) {
-                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  , number_of_rows_per_thread * n, MPI_INT, i, i,MPI_COMM_WORLD);
+                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  *n , number_of_rows_per_thread * n, MPI_INT, i, 100,MPI_COMM_WORLD);
+                MPI_Send(B_T.get_data().data() + i * number_of_rows_per_thread  *n , number_of_rows_per_thread * n, MPI_INT, i, 200,MPI_COMM_WORLD);
             }
-        }
-        else {
-            Matrix LocalA = Matrix(number_of_rows_per_thread, n);
-            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, rank,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-
-        // need to do the same for B
-        if (rank == 0) {
-            for (int i = 1; i < p; i++) {
-                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  , number_of_rows_per_thread * n, MPI_INT, i, i,MPI_COMM_WORLD);
-            }
-        }
-        else {
-            Matrix LocalA = Matrix(number_of_rows_per_thread, n);
-            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, rank,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        } else {
+            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, 100,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(LocalB_T.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, 200,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
 
         for (i = start; i < end; i++) {
             for (j = 0; j < b_columns; j++) {
                 int temp = 0;
                 for (k = 0; k < n; k++) {
-                    int a = A.get_value_at(i, k);
-                    int b = B.get_value_at(k, j);
-                    int c = a * b;
-                    temp += c;
+                    if (rank == 0) {
+                        int a = A.get_value_at(i, k);
+                        int b = B.get_value_at(k, j);
+                        int c = a * b;
+                        temp += c;
+                    } else {
+                        int a = LocalA.get_value_at(i - start, k);
+                        int b = LocalB_T.get_value_at(j - start, k);
+                        int c = a * b;
+                        temp += c;
+                    }
                 }
                 C.set_value_at(i, j, temp);
             }
@@ -191,7 +188,6 @@ int main(int argc,  char* argv[]) {
 
 
 
-    MPI_Finalize();
 
     int m, n, q, P, seed;
     P = size;
@@ -270,6 +266,7 @@ int main(int argc,  char* argv[]) {
     std::cout << duration_1d << ",";
     std::cout << duration_2d << ",";
     std::cout << seed << "\n";
+    MPI_Finalize();
 
     return 0;
 }

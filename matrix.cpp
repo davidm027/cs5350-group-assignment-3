@@ -19,6 +19,21 @@ Matrix::Matrix(int m, int n, std::vector<int> data) {
     }
 }
 
+// returns a new transpose matrix
+Matrix Matrix::transpose()  {
+
+    Matrix m = Matrix( this->columns, this->rows);
+
+    for (int i = 0; i < this->rows ; i++){
+        for (int j = 0; j < this->columns; j++) {
+
+            m.set_value_at(j, i, this->get_value_at(i, j));
+        }
+    }
+
+    return m;
+}
+
 Matrix::~Matrix() {
     data.clear();
 }
@@ -31,7 +46,7 @@ int Matrix::get_columns() {
     return this->columns;
 }
 
-std::vector<int> Matrix::get_data() {
+std::vector<int> & Matrix::get_data() {
     return this->data;
 }
 
