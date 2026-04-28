@@ -1,5 +1,5 @@
 # Create conda env
-conda create -n my-env -c conda-forge gxx_linux-64=13 gcc_linux-64=13 cmake make pkg-config boost-cpp -y
+conda create -n my-env -c conda-forge gxx_linux-64=13 gcc_linux-64=13 cmake make pkg-config boost-cpp openmpi openmpi-mpicxx -y
 
 # Activate conda env
 conda activate my-env

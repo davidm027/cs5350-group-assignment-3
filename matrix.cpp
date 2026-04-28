@@ -1,4 +1,5 @@
 #include "matrix.hpp"
+
 #include <iostream>
 #include <sstream>
 
@@ -19,38 +20,23 @@ Matrix::Matrix(int m, int n, std::vector<int> data) {
     }
 }
 
-// returns a new transpose matrix
-Matrix Matrix::transpose()  {
-
-    Matrix m = Matrix( this->columns, this->rows);
-
-    for (int i = 0; i < this->rows ; i++){
-        for (int j = 0; j < this->columns; j++) {
-
-            m.set_value_at(j, i, this->get_value_at(i, j));
-        }
-    }
-
-    return m;
-}
-
 Matrix::~Matrix() {
     data.clear();
 }
 
-int Matrix::get_rows() {
+int Matrix::get_rows() const {
     return this->rows;
 }
 
-int Matrix::get_columns() {
+int Matrix::get_columns() const {
     return this->columns;
 }
 
-std::vector<int> & Matrix::get_data() {
+const std::vector<int>& Matrix::get_data() const {
     return this->data;
 }
 
-int Matrix::get_value_at(int row, int col) {
+int Matrix::get_value_at(int row, int col) const {
     int idx = this->columns * row + col;
     return this->data[idx];
 }
@@ -60,16 +46,18 @@ void Matrix::set_value_at(int row, int col, int val) {
     this->data[idx] = val;
 }
 
-std::ostream& operator<<(std::ostream& os, Matrix m) {
-    for (unsigned int i = 0; i < m.get_rows(); i++) {
+std::ostream& operator<<(std::ostream& os, const Matrix& m) {
+    for (int i = 0; i < m.get_rows(); i++) {
         if (i == 0) {
             os << "[ ";
         } else {
             os << "  ";
         }
-        for (unsigned int j = 0; j < m.get_columns(); j++) {
+
+        for (int j = 0; j < m.get_columns(); j++) {
             os << m.get_value_at(i, j) << " ";
         }
+
         if (i == m.get_rows() - 1) {
             os << "]";
         }

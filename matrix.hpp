@@ -1,6 +1,6 @@
+#include <ostream>
 #include <string>
 #include <vector>
-#include <ostream>
 
 class Matrix {
    private:
@@ -9,15 +9,15 @@ class Matrix {
     std::vector<int> data;
 
    public:
-    Matrix();
     Matrix(int, int);
     Matrix(int, int, std::vector<int>);
-    Matrix transpose() ;
     ~Matrix();
-    int get_rows();
-    int get_columns();
-    std::vector<int> & get_data();
-    int get_value_at(int, int);
+
+    int get_rows() const;
+    int get_columns() const;
+    const std::vector<int>& get_data() const;
+    int get_value_at(int, int) const;
     void set_value_at(int, int, int);
-    friend std::ostream& operator<<(std::ostream&, Matrix);
+
+    friend std::ostream& operator<<(std::ostream&, const Matrix&);
 };

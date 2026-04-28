@@ -1,4 +1,4 @@
-// Comparison of the performances of serial and parallel
+// Comparison of the performances of serial and MPI 1D
 // Matrix Multiplication algorithm implementations
 
 #include <mpi.h>
@@ -6,162 +6,532 @@
 #include <boost/program_options.hpp>
 #include <cassert>
 #include <chrono>
-#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
+// #include "ctrack.hpp"
 #include "matrix.hpp"
 
-// Serial algorithm
-// Matrix A (dims mxn) * Matrix B (dims nxp) = Matrix C (dims mxp)
-Matrix MM_ser(Matrix A, Matrix B) {
-    int m = A.get_rows();
-    int n = A.get_columns();
-    int p = B.get_columns();
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
-    Matrix C(m, p);
+Matrix transpose_matrix(Matrix B) {
+    int rows = B.get_rows();
+    int cols = B.get_columns();
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < p; j++) {
+    Matrix BT(cols, rows);
+
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            BT.set_value_at(j, i, B.get_value_at(i, j));
+        }
+    }
+
+    return BT;
+}
+
+std::vector<int> extract_row_block(Matrix M, int start_row, int num_rows) {
+    int cols = M.get_columns();
+    std::vector<int> block;
+    block.reserve(num_rows * cols);
+
+    for (int i = start_row; i < start_row + num_rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            block.push_back(M.get_value_at(i, j));
+        }
+    }
+
+    return block;
+}
+
+void place_row_block(Matrix& M,
+                     int start_row,
+                     const std::vector<int>& block,
+                     int num_rows) {
+    int cols = M.get_columns();
+    int idx = 0;
+
+    for (int i = start_row; i < start_row + num_rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            M.set_value_at(i, j, block[idx++]);
+        }
+    }
+}
+
+void get_row_range(int total_rows,
+                   int active_procs,
+                   int rank,
+                   int& start,
+                   int& end) {
+    if (rank >= active_procs) {
+        start = 0;
+        end = 0;
+        return;
+    }
+
+    int rows_per_proc = total_rows / active_procs;
+    start = rank * rows_per_proc;
+
+    if (rank == active_procs - 1) {
+        end = total_rows;
+    } else {
+        end = start + rows_per_proc;
+    }
+}
+
+Matrix multiply_local_rows(Matrix A_local, Matrix BT) {
+    int local_rows = A_local.get_rows();
+    int n = A_local.get_columns();
+    int q = BT.get_rows();
+
+    Matrix local_C(local_rows, q);
+
+    for (int i = 0; i < local_rows; i++) {
+        for (int j = 0; j < q; j++) {
             int temp = 0;
             for (int k = 0; k < n; k++) {
-                int a = A.get_value_at(i, k);
-                int b = B.get_value_at(k, j);
-                int c = a * b;
-                temp += c;
+                temp += A_local.get_value_at(i, k) * BT.get_value_at(j, k);
+            }
+            local_C.set_value_at(i, j, temp);
+        }
+    }
+
+    return local_C;
+}
+
+void multiply_add_local_blocks(const Matrix& A_block,
+                               const Matrix& B_block,
+                               Matrix& C_block) {
+    int m = A_block.get_rows();
+    int n = A_block.get_columns();
+    int q = B_block.get_columns();
+
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < q; j++) {
+            int temp = C_block.get_value_at(i, j);
+            for (int k = 0; k < n; k++) {
+                temp += A_block.get_value_at(i, k) * B_block.get_value_at(k, j);
+            }
+            C_block.set_value_at(i, j, temp);
+        }
+    }
+}
+
+bool matrices_equal(Matrix A, Matrix B) {
+    if (A.get_rows() != B.get_rows() || A.get_columns() != B.get_columns()) {
+        return false;
+    }
+
+    for (int i = 0; i < A.get_rows(); i++) {
+        for (int j = 0; j < A.get_columns(); j++) {
+            if (A.get_value_at(i, j) != B.get_value_at(i, j)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Serial algorithm
+// Matrix A (dims m x n) * Matrix B (dims n x q) = Matrix C (dims m x q)
+// ------------------------------------------------------------
+
+Matrix MM_ser(Matrix A, Matrix B) {
+    // CTRACK;
+    int m = A.get_rows();
+    int n = A.get_columns();
+    int q = B.get_columns();
+
+    Matrix C(m, q);
+
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < q; j++) {
+            int temp = 0;
+            for (int k = 0; k < n; k++) {
+                temp += A.get_value_at(i, k) * B.get_value_at(k, j);
             }
             C.set_value_at(i, j, temp);
         }
     }
+
     return C;
 }
 
+// ------------------------------------------------------------
+// MPI 1D algorithm
+// Rank 0 owns full A and B initially
+// Rank 0 transposes B into BT and sends:
+//   - each worker its assigned rows of A
+//   - the full BT
+// Workers compute local rows of C and send them back to rank 0
+// ------------------------------------------------------------
 
-// 1D Parallel algorithm
+Matrix MM_1D_MPI(Matrix A, Matrix B, int rank, int world_size) {
+    int m = 0;
+    int n = 0;
+    int q = 0;
+    int active_procs = 0;
 
-// issues to fix:
-// I think we should check if matrix not square, basically last thread shoudl get whatever low left,
-// not sure if indexing in transpose is correct need to fix!
-// need to send calculation results back to process 0
-Matrix MM_1D(Matrix A, Matrix B, int p) {
-
-    if (p > A.get_rows())
-        p = A.get_rows();
-    int m = A.get_rows();
-    int n = A.get_columns();
-    int b_columns = B.get_columns();
-    int number_of_rows_per_thread = A.get_rows() / p;
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    Matrix B_T = B.transpose();
-    Matrix C(m, b_columns);
-    {
-        int i, j, k;
-        int thread_num = rank;
-        int start = thread_num * number_of_rows_per_thread;
-        int end = thread_num * number_of_rows_per_thread + number_of_rows_per_thread;
-        if (thread_num == p - 1) {
-            end = A.get_rows();
+    if (rank == 0) {
+        assert(A.get_columns() == B.get_rows());
+        m = A.get_rows();
+        n = A.get_columns();
+        q = B.get_columns();
+        active_procs = (m < world_size) ? m : world_size;
+        if (active_procs <= 0) {
+            active_procs = 1;
         }
-        Matrix LocalA(number_of_rows_per_thread, n);
-        Matrix LocalB_T(n, number_of_rows_per_thread);
+    }
 
-        // sending data from process 0 to all the others (sending n/p chunks
-        if (rank == 0) {
-            for (int i = 1; i < p; i++) {
-                MPI_Send(A.get_data().data() + i * number_of_rows_per_thread  *n , number_of_rows_per_thread * n, MPI_INT, i, 100,MPI_COMM_WORLD);
-                MPI_Send(B_T.get_data().data() + i * number_of_rows_per_thread  *n , number_of_rows_per_thread * n, MPI_INT, i, 200,MPI_COMM_WORLD);
+    if (rank == 0) {
+        Matrix BT = transpose_matrix(B);
+        std::vector<int> bt_data = BT.get_data();
+        Matrix C(m, q);
+
+        int meta[4];
+        meta[0] = m;
+        meta[1] = n;
+        meta[2] = q;
+        meta[3] = active_procs;
+
+        for (int dest = 1; dest < world_size; dest++) {
+            MPI_Send(meta, 4, MPI_INT, dest, 0, MPI_COMM_WORLD);
+
+            int start, end;
+            get_row_range(m, active_procs, dest, start, end);
+            int local_rows = end - start;
+
+            std::vector<int> a_block = extract_row_block(A, start, local_rows);
+
+            MPI_Send(&local_rows, 1, MPI_INT, dest, 1, MPI_COMM_WORLD);
+
+            if (local_rows > 0) {
+                MPI_Send(a_block.data(), local_rows * n, MPI_INT, dest, 2,
+                         MPI_COMM_WORLD);
             }
-        } else {
-            MPI_Recv(LocalA.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, 100,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            MPI_Recv(LocalB_T.get_data().data() , number_of_rows_per_thread * n, MPI_INT, 0, 200,MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            MPI_Send(bt_data.data(), q * n, MPI_INT, dest, 3, MPI_COMM_WORLD);
         }
 
-        for (i = start; i < end; i++) {
-            for (j = 0; j < b_columns; j++) {
-                int temp = 0;
-                for (k = 0; k < n; k++) {
-                    if (rank == 0) {
-                        int a = A.get_value_at(i, k);
-                        int b = B.get_value_at(k, j);
-                        int c = a * b;
-                        temp += c;
-                    } else {
-                        int a = LocalA.get_value_at(i - start, k);
-                        int b = LocalB_T.get_value_at(j - start, k);
-                        int c = a * b;
-                        temp += c;
-                    }
+        int root_start, root_end;
+        get_row_range(m, active_procs, 0, root_start, root_end);
+        int root_rows = root_end - root_start;
+
+        std::vector<int> root_a_block =
+            extract_row_block(A, root_start, root_rows);
+        Matrix A_local(root_rows, n, root_a_block);
+        Matrix local_C = multiply_local_rows(A_local, BT);
+
+        std::vector<int> local_c_data = local_C.get_data();
+        place_row_block(C, root_start, local_c_data, root_rows);
+
+        for (int src = 1; src < world_size; src++) {
+            int start, end;
+            get_row_range(m, active_procs, src, start, end);
+            int local_rows = end - start;
+
+            std::vector<int> recv_block(local_rows * q);
+
+            if (local_rows > 0) {
+                MPI_Recv(recv_block.data(), local_rows * q, MPI_INT, src, 4,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                place_row_block(C, start, recv_block, local_rows);
+            }
+        }
+
+        return C;
+    } else {
+        int meta[4];
+        MPI_Recv(meta, 4, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        m = meta[0];
+        n = meta[1];
+        q = meta[2];
+        active_procs = meta[3];
+
+        int local_rows = 0;
+        MPI_Recv(&local_rows, 1, MPI_INT, 0, 1, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        std::vector<int> a_block(local_rows * n);
+        if (local_rows > 0) {
+            MPI_Recv(a_block.data(), local_rows * n, MPI_INT, 0, 2,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
+        std::vector<int> bt_data(q * n);
+        MPI_Recv(bt_data.data(), q * n, MPI_INT, 0, 3, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        Matrix A_local(local_rows, n, a_block);
+        Matrix BT(q, n, bt_data);
+
+        Matrix local_C = multiply_local_rows(A_local, BT);
+        std::vector<int> local_c_data = local_C.get_data();
+
+        if (local_rows > 0) {
+            MPI_Send(local_c_data.data(), local_rows * q, MPI_INT, 0, 4,
+                     MPI_COMM_WORLD);
+        }
+
+        return Matrix(0, 0);
+    }
+}
+
+Matrix MM_2D(Matrix A, Matrix B, int rank, int world_size) {
+    int m = 0;
+    int n = 0;
+    int q = 0;
+    int active_procs = 0;
+    int thread_dim = 0;
+
+    if (rank == 0) {
+        assert(A.get_columns() == B.get_rows());
+        m = A.get_rows();
+        n = A.get_columns();
+        q = B.get_columns();
+
+        thread_dim = (int)std::sqrt(world_size);
+
+        assert(thread_dim > 0);
+        assert(m % thread_dim == 0);
+        assert(n % thread_dim == 0);
+        assert(q % thread_dim == 0);
+
+        assert(thread_dim * thread_dim == world_size);
+        active_procs = thread_dim * thread_dim;
+
+        int meta[5];
+        meta[0] = m;
+        meta[1] = n;
+        meta[2] = q;
+        meta[3] = thread_dim;
+        meta[4] = active_procs;
+
+        for (int dest = 1; dest < active_procs; dest++) {
+            MPI_Send(meta, 5, MPI_INT, dest, 0, MPI_COMM_WORLD);
+        }
+    } else {
+        int meta[5];
+        MPI_Recv(meta, 5, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        m = meta[0];
+        n = meta[1];
+        q = meta[2];
+        thread_dim = meta[3];
+        active_procs = meta[4];
+    }
+
+    int a_block_rows = m / thread_dim;
+    int a_block_cols = n / thread_dim;
+    int b_block_rows = n / thread_dim;
+    int b_block_cols = q / thread_dim;
+    int c_block_rows = m / thread_dim;
+    int c_block_cols = q / thread_dim;
+    int row = rank / thread_dim;
+    int col = rank % thread_dim;
+
+    Matrix C(m, q);
+
+    Matrix A_local(a_block_rows, a_block_cols);
+    Matrix B_local(b_block_rows, b_block_cols);
+    Matrix C_local(c_block_rows, c_block_cols);
+
+    if (rank == 0) {
+        for (int dest = 1; dest < active_procs; dest++) {
+            std::vector<int> vec_A;
+            std::vector<int> vec_B;
+            int p_row = dest / thread_dim;
+            int p_col = dest % thread_dim;
+            int a_row_start = p_row * a_block_rows;
+            int a_col_start = p_col * a_block_cols;
+            int b_row_start = p_row * b_block_rows;
+            int b_col_start = p_col * b_block_cols;
+            for (int i = 0; i < a_block_rows; i++) {
+                for (int j = 0; j < a_block_cols; j++) {
+                    vec_A.push_back(
+                        A.get_value_at(a_row_start + i, a_col_start + j));
                 }
-                C.set_value_at(i, j, temp);
+            }
+            for (int i = 0; i < b_block_rows; i++) {
+                for (int j = 0; j < b_block_cols; j++) {
+                    vec_B.push_back(
+                        B.get_value_at(b_row_start + i, b_col_start + j));
+                }
+            }
+            MPI_Send(vec_A.data(), a_block_rows * a_block_cols, MPI_INT, dest,
+                     0, MPI_COMM_WORLD);
+            MPI_Send(vec_B.data(), b_block_rows * b_block_cols, MPI_INT, dest,
+                     1, MPI_COMM_WORLD);
+        }
+
+        int a_row_start = row * a_block_rows;
+        int a_col_start = col * a_block_cols;
+
+        int b_row_start = row * b_block_rows;
+        int b_col_start = col * b_block_cols;
+
+        std::vector<int> vec_A;
+        for (int i = 0; i < a_block_rows; i++) {
+            for (int j = 0; j < a_block_cols; j++) {
+                vec_A.push_back(
+                    A.get_value_at(a_row_start + i, a_col_start + j));
+            }
+        }
+        std::vector<int> vec_B;
+        for (int i = 0; i < b_block_rows; i++) {
+            for (int j = 0; j < b_block_cols; j++) {
+                vec_B.push_back(
+                    B.get_value_at(b_row_start + i, b_col_start + j));
+            }
+        }
+
+        for (int i = 0; i < a_block_rows; i++) {
+            for (int j = 0; j < a_block_cols; j++) {
+                A_local.set_value_at(i, j, vec_A.at(i * a_block_cols + j));
+            }
+        }
+        for (int i = 0; i < b_block_rows; i++) {
+            for (int j = 0; j < b_block_cols; j++) {
+                B_local.set_value_at(i, j, vec_B.at(i * b_block_cols + j));
+            }
+        }
+    } else {
+        std::vector<int> tempA(a_block_rows * a_block_cols);
+        MPI_Recv(tempA.data(), a_block_rows * a_block_cols, MPI_INT, 0, 0,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        std::vector<int> tempB(b_block_rows * b_block_cols);
+        MPI_Recv(tempB.data(), b_block_rows * b_block_cols, MPI_INT, 0, 1,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        for (int i = 0; i < a_block_rows; i++) {
+            for (int j = 0; j < a_block_cols; j++) {
+                A_local.set_value_at(i, j, tempA.at(i * a_block_cols + j));
+            }
+        }
+        for (int i = 0; i < b_block_rows; i++) {
+            for (int j = 0; j < b_block_cols; j++) {
+                B_local.set_value_at(i, j, tempB.at(i * b_block_cols + j));
             }
         }
     }
-    return C;
-}
+    for (int round = 0; round < thread_dim; round++) {
+        int round_block = (row + round) % thread_dim;
+        int ownerA = row * thread_dim + round_block;
+        int ownerB = round_block * thread_dim + col;
 
-// 2D Parallel algorithm
-Matrix MM_2D(Matrix A, Matrix B, int p) {
-    // CTRACK;
-    int m1 = A.get_rows();
-    int n1 = A.get_columns();
-    int n2 = B.get_columns();
+        Matrix A_round(a_block_rows, a_block_cols);
+        Matrix B_round(b_block_rows, b_block_cols);
 
-    Matrix C(m1, n2);
-    // int thread_dim = (int)std::sqrt(p);
-    // int number_of_rows_per_thread = A.get_rows() / thread_dim;
-    // int number_of_columns_per_thread = B.get_columns() / thread_dim;
-    // omp_set_num_threads(p);
-    //
-    //
-    // #pragma omp parallel shared(A, B, C)
-    // {
-    //     int i, j, k;
-    //     int thread_num = omp_get_thread_num();
-    //     int row = thread_num / thread_dim;
-    //     int col = thread_num % thread_dim;
-    //     int start = row * number_of_rows_per_thread;
-    //     int end = m1;
-    //     if (end <= m1) {
-    //         end = start + number_of_rows_per_thread;
-    //     }
-    //
-    //     int column_start = col * number_of_columns_per_thread;
-    //
-    //     int end_column = n2;
-    //
-    //     if (end_column <= n2) {
-    //         end_column = column_start + number_of_columns_per_thread;
-    //     }
-    //
-    //     int k_start = col * (n1/thread_dim);
-    //
-    //     int k_end = n1;
-    //
-    //     if (k_end <= n1) {
-    //         k_end = k_start + (n1 / thread_dim);
-    //
-    //     }
-    //
-    //     for (i = start; i < end; i++) {
-    //         for (j = 0; j < n2; j++) {
-    //             int temp = 0;
-    //             for (k = k_start; k < k_end; k++) {
-    //                 int a = A.get_value_at(i, k);
-    //                 int b = B.get_value_at(k, j);
-    //                 temp += a * b;
-    //             }
-    //             #pragma omp critical
-    //             {
-    //                 temp += C.get_value_at(i, j);
-    //                 C.set_value_at(i, j, temp);
-    //             }
-    //         }
-    //     }
-    // }
-    return C;
+        if (col == round_block) {
+            for (int i = 0; i < a_block_rows; i++) {
+                for (int j = 0; j < a_block_cols; j++) {
+                    A_round.set_value_at(i, j, A_local.get_value_at(i, j));
+                }
+            }
+
+            std::vector<int> sendA;
+            for (int i = 0; i < a_block_rows; i++) {
+                for (int j = 0; j < a_block_cols; j++) {
+                    sendA.push_back(A_local.get_value_at(i, j));
+                }
+            }
+
+            for (int dest_col = 0; dest_col < thread_dim; dest_col++) {
+                int dest = row * thread_dim + dest_col;
+                if (dest != rank) {
+                    MPI_Send(sendA.data(), a_block_rows * a_block_cols, MPI_INT,
+                             dest, 20 + round, MPI_COMM_WORLD);
+                }
+            }
+        } else {
+            std::vector<int> recvA(a_block_rows * a_block_cols);
+
+            MPI_Recv(recvA.data(), a_block_rows * a_block_cols, MPI_INT, ownerA,
+                     20 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            for (int i = 0; i < a_block_rows; i++) {
+                for (int j = 0; j < a_block_cols; j++) {
+                    A_round.set_value_at(i, j, recvA.at(i * a_block_cols + j));
+                }
+            }
+        }
+        if (row == round_block) {
+            for (int i = 0; i < b_block_rows; i++) {
+                for (int j = 0; j < b_block_cols; j++) {
+                    B_round.set_value_at(i, j, B_local.get_value_at(i, j));
+                }
+            }
+
+            std::vector<int> sendB;
+
+            for (int i = 0; i < b_block_rows; i++) {
+                for (int j = 0; j < b_block_cols; j++) {
+                    sendB.push_back(B_local.get_value_at(i, j));
+                }
+            }
+
+            for (int dest_row = 0; dest_row < thread_dim; dest_row++) {
+                int dest = dest_row * thread_dim + col;
+                if (dest != rank) {
+                    MPI_Send(sendB.data(), b_block_rows * b_block_cols, MPI_INT,
+                             dest, 40 + round, MPI_COMM_WORLD);
+                }
+            }
+        } else {
+            std::vector<int> recvB(b_block_rows * b_block_cols);
+
+            MPI_Recv(recvB.data(), b_block_rows * b_block_cols, MPI_INT, ownerB,
+                     40 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            for (int i = 0; i < b_block_rows; i++) {
+                for (int j = 0; j < b_block_cols; j++) {
+                    B_round.set_value_at(i, j, recvB.at(i * b_block_cols + j));
+                }
+            }
+        }
+        multiply_add_local_blocks(A_round, B_round, C_local);
+    }
+
+    if (rank == 0) {
+        for (int i = 0; i < c_block_rows; i++) {
+            for (int j = 0; j < c_block_cols; j++) {
+                C.set_value_at(i, j, C_local.get_value_at(i, j));
+            }
+        }
+
+        for (int src = 1; src < active_procs; src++) {
+            std::vector<int> recv_block(c_block_rows * c_block_cols);
+
+            MPI_Recv(recv_block.data(), c_block_rows * c_block_cols, MPI_INT,
+                     src, 4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            Matrix temp_C_local(c_block_rows, c_block_cols, recv_block);
+            int p_row = src / thread_dim;
+            int p_col = src % thread_dim;
+            int c_row_start = p_row * c_block_rows;
+            int c_col_start = p_col * c_block_cols;
+            for (int i = 0; i < c_block_rows; i++) {
+                for (int j = 0; j < c_block_cols; j++) {
+                    C.set_value_at(c_row_start + i, c_col_start + j,
+                                   temp_C_local.get_value_at(i, j));
+                }
+            }
+        }
+        return C;
+    } else {
+        std::vector<int> C_local_data = C_local.get_data();
+        MPI_Send(C_local_data.data(), c_block_rows * c_block_cols, MPI_INT, 0,
+                 4, MPI_COMM_WORLD);
+
+        return Matrix(0, 0);
+    }
 }
 
 Matrix create_random_matrix(int rows, int columns, unsigned int seed = 5350) {
@@ -170,28 +540,28 @@ Matrix create_random_matrix(int rows, int columns, unsigned int seed = 5350) {
 
     int size = rows * columns;
     for (int i = 0; i < size; i++) {
-        int r = (int)rng() % 1000;
+        int r = static_cast<int>(rng() % 1000);
         v.push_back(r);
     }
 
     Matrix C(rows, columns, v);
-
     return C;
 }
 
-int main(int argc,  char* argv[]) {
+int main(int argc, const char* argv[]) {
+    MPI_Init(nullptr, nullptr);
 
-    MPI_Init(&argc, &argv);
+    int rank = 0;
+    int world_size = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    int size;
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-
-
-
-    int m, n, q, P, seed;
-    P = size;
-    std::string fname;
+    int m = 0;
+    int n = 0;
+    int q = 0;
+    int P = 0;
+    int seed = 5350;
+    std::string fname = "results.txt";
 
     namespace po = boost::program_options;
     po::options_description desc("Allowed options");
@@ -210,63 +580,168 @@ int main(int argc,  char* argv[]) {
     po::notify(vm);
 
     if (vm.count("help")) {
-        std::cout << desc << '\n';
-    } else {
-        if (vm.count("rows-A") && vm.count("columns-A") &&
-            vm.count("columns-B") && vm.count("processors")) {
-            m = vm["rows-A"].as<int>();
-            n = vm["columns-A"].as<int>();
-            q = vm["columns-B"].as<int>();
-            P = vm["processors"].as<int>();
+        if (rank == 0) {
+            std::cout << desc << '\n';
+        }
+        MPI_Finalize();
+        return 0;
+    }
 
-            if (vm.count("rows-A")) {
-                fname = vm["output-file"].as<std::string>();
-            }
-            if (vm.count("seed")) {
-                seed = vm["seed"].as<int>();
-            }
-        } else {
+    if (!(vm.count("rows-A") && vm.count("columns-A") &&
+          vm.count("columns-B") && vm.count("processors"))) {
+        if (rank == 0) {
             std::cout << "Not all variables were set.\n";
-            return -1;
+        }
+        MPI_Finalize();
+        return -1;
+    }
+
+    m = vm["rows-A"].as<int>();
+    n = vm["columns-A"].as<int>();
+    q = vm["columns-B"].as<int>();
+    P = vm["processors"].as<int>();
+
+    if (vm.count("output-file")) {
+        fname = vm["output-file"].as<std::string>();
+    }
+    if (vm.count("seed")) {
+        seed = vm["seed"].as<int>();
+    }
+
+    if (rank == 0) {
+        std::cout << "seed: " << seed << ", ";
+        std::cout << "m: " << m << ", ";
+        std::cout << "n: " << n << ", ";
+        std::cout << "q: " << q << ", ";
+        std::cout << "P(arg): " << P << ", ";
+        std::cout << "MPI world_size: " << world_size << "\n";
+    }
+
+    Matrix a(0, 0);
+    Matrix b(0, 0);
+
+    if (rank == 0) {
+        a = create_random_matrix(m, n, seed);
+        b = create_random_matrix(n, q, seed);
+    }
+
+    Matrix c_serial(0, 0);
+    Matrix c_mpi(0, 0);
+    Matrix c_mpi_2d(0, 0);
+
+    std::chrono::steady_clock::time_point serial_start;
+    std::chrono::steady_clock::time_point serial_end;
+    std::chrono::steady_clock::time_point mpi_start;
+    std::chrono::steady_clock::time_point mpi_end;
+    std::chrono::steady_clock::time_point mpi_2d_start;
+    std::chrono::steady_clock::time_point mpi_2d_end;
+
+    if (rank == 0) {
+        serial_start = std::chrono::steady_clock::now();
+        c_serial = MM_ser(a, b);
+        serial_end = std::chrono::steady_clock::now();
+    }
+
+    mpi_start = std::chrono::steady_clock::now();
+    c_mpi = MM_1D_MPI(a, b, rank, world_size);
+    mpi_end = std::chrono::steady_clock::now();
+
+    mpi_2d_start = std::chrono::steady_clock::now();
+    c_mpi_2d = MM_2D(a, b, rank, world_size);
+    mpi_2d_end = std::chrono::steady_clock::now();
+
+    if (rank == 0) {
+        bool correct = matrices_equal(c_serial, c_mpi);
+        bool correct_2d = matrices_equal(c_serial, c_mpi_2d);
+
+        // std::string results = ctrack::result_as_string();
+        std::ofstream out(fname);
+        out << "--- SEED: " << seed << " ---\n";
+        out << "m: " << m << ", ";
+        out << "n: " << n << ", ";
+        out << "q: " << q << ", ";
+        out << "P(arg): " << P << ", ";
+        out << "MPI world_size: " << world_size << "\n";
+        out << "Correctness (serial == MPI_1D): " << (correct ? "PASS" : "FAIL")
+            << "\n";
+        out << "Correctness (serial == MPI_2D): "
+            << (correct_2d ? "PASS" : "FAIL") << "\n";
+
+        auto serial_duration =
+            std::chrono::duration<double>(serial_end - serial_start).count();
+        auto mpi_duration =
+            std::chrono::duration<double>(mpi_end - mpi_start).count();
+        auto mpi_2d_duration =
+            std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count();
+
+        out << "Serial time (s): " << serial_duration << "\n";
+        out << "MPI 1D time (s): " << mpi_duration << "\n";
+        out << "MPI 2D time (s): " << mpi_2d_duration << "\n";
+
+        if (mpi_duration > 0.0) {
+            out << "MPI 1D Stats:" << "\n";
+            out << "Speedup: " << (serial_duration / mpi_duration) << "\n";
+            out << "Cost: " << (world_size * mpi_duration) << "\n";
+        }
+
+        if (mpi_2d_duration > 0.0) {
+            out << "MPI 2D Stats:" << "\n";
+            out << "Speedup: " << (serial_duration / mpi_2d_duration) << "\n";
+            out << "Cost: " << (world_size * mpi_2d_duration) << "\n";
+        }
+
+        // out << results;
+        out.close();
+
+        std::cout << "Correctness (serial == MPI_1D): "
+                  << (correct ? "PASS" : "FAIL") << "\n";
+        std::cout << "Correctness (serial == MPI_2D): "
+                  << (correct_2d ? "PASS" : "FAIL") << "\n";
+        std::cout
+            << "Serial time (s): "
+            << std::chrono::duration<double>(serial_end - serial_start).count()
+            << "\n";
+        std::cout << "MPI 1D time (s): "
+                  << std::chrono::duration<double>(mpi_end - mpi_start).count()
+                  << "\n";
+        std::cout
+            << "MPI 2D time (s): "
+            << std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count()
+            << "\n";
+
+        if (std::chrono::duration<double>(mpi_end - mpi_start).count() > 0.0) {
+            out << "MPI 1D Stats:" << "\n";
+            std::cout
+                << "Speedup: "
+                << (std::chrono::duration<double>(serial_end - serial_start)
+                        .count() /
+                    std::chrono::duration<double>(mpi_end - mpi_start).count())
+                << "\n";
+            std::cout
+                << "Cost: "
+                << (world_size *
+                    std::chrono::duration<double>(mpi_end - mpi_start).count())
+                << "\n";
+        }
+
+        if (std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count() >
+            0.0) {
+            out << "MPI 2D Stats:" << "\n";
+            std::cout
+                << "Speedup: "
+                << (std::chrono::duration<double>(serial_end - serial_start)
+                        .count() /
+                    std::chrono::duration<double>(mpi_2d_end - mpi_2d_start)
+                        .count())
+                << "\n";
+            std::cout << "Cost: "
+                      << (world_size * std::chrono::duration<double>(
+                                           mpi_2d_end - mpi_2d_start)
+                                           .count())
+                      << "\n";
         }
     }
 
-    // actual code to run everything
-    Matrix a = create_random_matrix(m, n, seed);
-    Matrix b = create_random_matrix(n, q, seed);
-
-    auto start_ser = std::chrono::steady_clock::now();
-    Matrix c1 = MM_ser(a, b);
-    auto end_ser = std::chrono::steady_clock::now();
-    auto duration_ser = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::duration<double>(end_ser - start_ser))
-                            .count();
-
-
-
-    auto start_1d = std::chrono::steady_clock::now();
-    Matrix c3 = MM_1D(a, b, P);
-    auto end_1d = std::chrono::steady_clock::now();
-    auto duration_1d = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::duration<double>(end_1d - start_1d))
-                           .count();
-
-    auto start_2d = std::chrono::steady_clock::now();
-    Matrix c4 = MM_2D(a, b, P);
-    auto end_2d = std::chrono::steady_clock::now();
-    auto duration_2d = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::duration<double>(end_2d - start_2d))
-                           .count();
-
-    std::cout << m << ",";
-    std::cout << n << ",";
-    std::cout << q << ",";
-    std::cout << P << ",";
-    std::cout << duration_ser << ",";
-    std::cout << duration_1d << ",";
-    std::cout << duration_2d << ",";
-    std::cout << seed << "\n";
     MPI_Finalize();
-
     return 0;
 }
