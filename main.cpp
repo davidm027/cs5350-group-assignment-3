@@ -111,12 +111,13 @@ void multiply_add_local_blocks(const Matrix& A_block,
     int q = B_block.get_columns();
 
     for (int i = 0; i < m; i++) {
-        for (int j = 0; j < q; j++) {
-            int temp = C_block.get_value_at(i, j);
-            for (int k = 0; k < n; k++) {
-                temp += A_block.get_value_at(i, k) * B_block.get_value_at(k, j);
+        for (int k = 0; k < n; k++) {
+            int a = A_block.get_value_at(i, k);
+            for (int j = 0; j < q; j++) {
+                int cur = C_block.get_value_at(i, j);
+                cur += a * B_block.get_value_at(k, j);
+                C_block.set_value_at(i, j, cur);
             }
-            C_block.set_value_at(i, j, temp);
         }
     }
 }
@@ -421,13 +422,19 @@ Matrix MM_2D(Matrix A, Matrix B, int rank, int world_size) {
             }
         }
     }
+
+    std::vector<int> sendA_buf(a_block_rows * a_block_cols);
+    std::vector<int> recvA_buf(a_block_rows * a_block_cols);
+    std::vector<int> sendB_buf(b_block_rows * b_block_cols);
+    std::vector<int> recvB_buf(b_block_rows * b_block_cols);
+
+    Matrix A_round(a_block_rows, a_block_cols);
+    Matrix B_round(b_block_rows, b_block_cols);
+
     for (int round = 0; round < thread_dim; round++) {
-        int round_block = (row + round) % thread_dim;
+        int round_block = round;
         int ownerA = row * thread_dim + round_block;
         int ownerB = round_block * thread_dim + col;
-
-        Matrix A_round(a_block_rows, a_block_cols);
-        Matrix B_round(b_block_rows, b_block_cols);
 
         if (col == round_block) {
             for (int i = 0; i < a_block_rows; i++) {
@@ -436,29 +443,28 @@ Matrix MM_2D(Matrix A, Matrix B, int rank, int world_size) {
                 }
             }
 
-            std::vector<int> sendA;
+            int idx = 0;
             for (int i = 0; i < a_block_rows; i++) {
                 for (int j = 0; j < a_block_cols; j++) {
-                    sendA.push_back(A_local.get_value_at(i, j));
+                    sendA_buf[idx++] = A_local.get_value_at(i, j);
                 }
             }
 
             for (int dest_col = 0; dest_col < thread_dim; dest_col++) {
                 int dest = row * thread_dim + dest_col;
                 if (dest != rank) {
-                    MPI_Send(sendA.data(), a_block_rows * a_block_cols, MPI_INT,
-                             dest, 20 + round, MPI_COMM_WORLD);
+                    MPI_Send(sendA_buf.data(), a_block_rows * a_block_cols,
+                             MPI_INT, dest, 20 + round, MPI_COMM_WORLD);
                 }
             }
         } else {
-            std::vector<int> recvA(a_block_rows * a_block_cols);
-
-            MPI_Recv(recvA.data(), a_block_rows * a_block_cols, MPI_INT, ownerA,
-                     20 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(recvA_buf.data(), a_block_rows * a_block_cols, MPI_INT,
+                     ownerA, 20 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             for (int i = 0; i < a_block_rows; i++) {
                 for (int j = 0; j < a_block_cols; j++) {
-                    A_round.set_value_at(i, j, recvA.at(i * a_block_cols + j));
+                    A_round.set_value_at(i, j,
+                                         recvA_buf.at(i * a_block_cols + j));
                 }
             }
         }
@@ -469,30 +475,28 @@ Matrix MM_2D(Matrix A, Matrix B, int rank, int world_size) {
                 }
             }
 
-            std::vector<int> sendB;
-
+            int idx = 0;
             for (int i = 0; i < b_block_rows; i++) {
                 for (int j = 0; j < b_block_cols; j++) {
-                    sendB.push_back(B_local.get_value_at(i, j));
+                    sendB_buf[idx++] = B_local.get_value_at(i, j);
                 }
             }
 
             for (int dest_row = 0; dest_row < thread_dim; dest_row++) {
                 int dest = dest_row * thread_dim + col;
                 if (dest != rank) {
-                    MPI_Send(sendB.data(), b_block_rows * b_block_cols, MPI_INT,
-                             dest, 40 + round, MPI_COMM_WORLD);
+                    MPI_Send(sendB_buf.data(), b_block_rows * b_block_cols,
+                             MPI_INT, dest, 40 + round, MPI_COMM_WORLD);
                 }
             }
         } else {
-            std::vector<int> recvB(b_block_rows * b_block_cols);
-
-            MPI_Recv(recvB.data(), b_block_rows * b_block_cols, MPI_INT, ownerB,
-                     40 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(recvB_buf.data(), b_block_rows * b_block_cols, MPI_INT,
+                     ownerB, 40 + round, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             for (int i = 0; i < b_block_rows; i++) {
                 for (int j = 0; j < b_block_cols; j++) {
-                    B_round.set_value_at(i, j, recvB.at(i * b_block_cols + j));
+                    B_round.set_value_at(i, j,
+                                         recvB_buf.at(i * b_block_cols + j));
                 }
             }
         }
@@ -608,15 +612,6 @@ int main(int argc, const char* argv[]) {
         seed = vm["seed"].as<int>();
     }
 
-    if (rank == 0) {
-        std::cout << "seed: " << seed << ", ";
-        std::cout << "m: " << m << ", ";
-        std::cout << "n: " << n << ", ";
-        std::cout << "q: " << q << ", ";
-        std::cout << "P(arg): " << P << ", ";
-        std::cout << "MPI world_size: " << world_size << "\n";
-    }
-
     Matrix a(0, 0);
     Matrix b(0, 0);
 
@@ -654,18 +649,10 @@ int main(int argc, const char* argv[]) {
         bool correct = matrices_equal(c_serial, c_mpi);
         bool correct_2d = matrices_equal(c_serial, c_mpi_2d);
 
-        // std::string results = ctrack::result_as_string();
-        std::ofstream out(fname);
-        out << "--- SEED: " << seed << " ---\n";
-        out << "m: " << m << ", ";
-        out << "n: " << n << ", ";
-        out << "q: " << q << ", ";
-        out << "P(arg): " << P << ", ";
-        out << "MPI world_size: " << world_size << "\n";
-        out << "Correctness (serial == MPI_1D): " << (correct ? "PASS" : "FAIL")
-            << "\n";
-        out << "Correctness (serial == MPI_2D): "
-            << (correct_2d ? "PASS" : "FAIL") << "\n";
+        std::cout << m << ",";
+        std::cout << n << ",";
+        std::cout << q << ",";
+        std::cout << P << ",";
 
         auto serial_duration =
             std::chrono::duration<double>(serial_end - serial_start).count();
@@ -674,72 +661,19 @@ int main(int argc, const char* argv[]) {
         auto mpi_2d_duration =
             std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count();
 
-        out << "Serial time (s): " << serial_duration << "\n";
-        out << "MPI 1D time (s): " << mpi_duration << "\n";
-        out << "MPI 2D time (s): " << mpi_2d_duration << "\n";
+        auto speedup_1d = (serial_duration / mpi_duration);
+        auto cost_1d = (world_size * mpi_duration);
+        auto speedup_2d = (serial_duration / mpi_2d_duration);
+        auto cost_2d = (world_size * mpi_2d_duration);
 
-        if (mpi_duration > 0.0) {
-            out << "MPI 1D Stats:" << "\n";
-            out << "Speedup: " << (serial_duration / mpi_duration) << "\n";
-            out << "Cost: " << (world_size * mpi_duration) << "\n";
-        }
-
-        if (mpi_2d_duration > 0.0) {
-            out << "MPI 2D Stats:" << "\n";
-            out << "Speedup: " << (serial_duration / mpi_2d_duration) << "\n";
-            out << "Cost: " << (world_size * mpi_2d_duration) << "\n";
-        }
-
-        // out << results;
-        out.close();
-
-        std::cout << "Correctness (serial == MPI_1D): "
-                  << (correct ? "PASS" : "FAIL") << "\n";
-        std::cout << "Correctness (serial == MPI_2D): "
-                  << (correct_2d ? "PASS" : "FAIL") << "\n";
-        std::cout
-            << "Serial time (s): "
-            << std::chrono::duration<double>(serial_end - serial_start).count()
-            << "\n";
-        std::cout << "MPI 1D time (s): "
-                  << std::chrono::duration<double>(mpi_end - mpi_start).count()
-                  << "\n";
-        std::cout
-            << "MPI 2D time (s): "
-            << std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count()
-            << "\n";
-
-        if (std::chrono::duration<double>(mpi_end - mpi_start).count() > 0.0) {
-            out << "MPI 1D Stats:" << "\n";
-            std::cout
-                << "Speedup: "
-                << (std::chrono::duration<double>(serial_end - serial_start)
-                        .count() /
-                    std::chrono::duration<double>(mpi_end - mpi_start).count())
-                << "\n";
-            std::cout
-                << "Cost: "
-                << (world_size *
-                    std::chrono::duration<double>(mpi_end - mpi_start).count())
-                << "\n";
-        }
-
-        if (std::chrono::duration<double>(mpi_2d_end - mpi_2d_start).count() >
-            0.0) {
-            out << "MPI 2D Stats:" << "\n";
-            std::cout
-                << "Speedup: "
-                << (std::chrono::duration<double>(serial_end - serial_start)
-                        .count() /
-                    std::chrono::duration<double>(mpi_2d_end - mpi_2d_start)
-                        .count())
-                << "\n";
-            std::cout << "Cost: "
-                      << (world_size * std::chrono::duration<double>(
-                                           mpi_2d_end - mpi_2d_start)
-                                           .count())
-                      << "\n";
-        }
+        std::cout << serial_duration << ",";
+        std::cout << mpi_duration << ",";
+        std::cout << mpi_2d_duration << ",";
+        std::cout << speedup_1d << ",";
+        std::cout << cost_1d << ",";
+        std::cout << speedup_2d << ",";
+        std::cout << cost_2d << ",";
+        std::cout << seed << "\n";
     }
 
     MPI_Finalize();
